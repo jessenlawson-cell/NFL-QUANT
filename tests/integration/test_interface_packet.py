@@ -8,7 +8,12 @@ import pytest
 
 from nfl_bets.config import Settings
 from nfl_bets.db import connect, initialize_database
-from scripts.export_interface_packet import load_validated_snapshot
+from scripts.export_interface_packet import (
+    build_packet,
+    export_snapshot,
+    load_validated_snapshot,
+    publish_packet,
+)
 
 SNAPSHOT_ID = "11111111-1111-4111-8111-111111111111"
 SNAPSHOT_TIME = "2026-09-27T12:45:00Z"
@@ -40,13 +45,31 @@ def source(tmp_path: Path) -> tuple[Path, Path]:
         ("1.1.2", "LOCKED_UNTESTED_2026"),
         ("challenger-0.2.0", "SHADOW_FROZEN_WEEK3_TO_8"),
     ):
+        artifact = tmp_path / "artifacts" / "models" / version / "candidate.joblib"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(f"fixture-artifact-{version}".encode())
+        spec = tmp_path / (
+            "MODEL_SPEC_V1_1.md" if version == "1.1.2" else "CHALLENGER_SPEC.md"
+        )
+        spec.write_text(f"fixture spec {version}\n", encoding="utf-8")
+        (manifests / f"model_{version}_development.json").write_text(
+            json.dumps(
+                {
+                    "model_version": version,
+                    "artifact": str(artifact.relative_to(tmp_path)).replace("\\", "/"),
+                    "artifact_hash": _hash(artifact.read_bytes()),
+                    "spec_hash": _hash(spec.read_bytes()),
+                }
+            ),
+            encoding="utf-8",
+        )
         (manifests / f"prospective_policy_{version}.json").write_text(
             json.dumps(
                 {
                     "model_version": version,
                     "status": status,
-                    "artifact_hash": "a" * 64,
-                    "spec_hash": "b" * 64,
+                    "artifact_hash": _hash(artifact.read_bytes()),
+                    "spec_hash": _hash(spec.read_bytes()),
                     "quote_max_age_minutes": 30,
                     "allowed_decisions": ["PASS"],
                 }
@@ -119,18 +142,47 @@ def source(tmp_path: Path) -> tuple[Path, Path]:
                 "content_hash": "game-hash",
             },
         )
+        for selection in ("HOME", "AWAY"):
+            _insert(
+                connection,
+                "market_odds",
+                {
+                    "snapshot_id": SNAPSHOT_ID,
+                    "provider_event_id": "event-1",
+                    "game_id": "game-1",
+                    "commence_time_utc": KICKOFF,
+                    "bookmaker_key": "pinnacle",
+                    "bookmaker_title": "Pinnacle",
+                    "bookmaker_group": "anchor",
+                    "market": "spreads",
+                    "selection": selection,
+                    "point": -3.5 if selection == "HOME" else 3.5,
+                    "canonical_line": -3.5,
+                    "american_price": -110,
+                    "decimal_price": 1.909090909,
+                    "implied_probability": 0.5238095238,
+                    "vig_free_probability": 0.5,
+                    "overround": 0.0476190476,
+                    "last_update_utc": "2026-09-27T12:40:00Z",
+                    "source": "fixture",
+                    "retrieved_at_utc": SNAPSHOT_TIME,
+                    "schema_version": "1.1.0",
+                    "content_hash": f"quote-{selection}",
+                },
+            )
         for version in ("1.1.2", "challenger-0.2.0"):
             policy_bytes = (
                 manifests / f"prospective_policy_{version}.json"
             ).read_bytes()
+            policy = json.loads(policy_bytes)
             _insert(
                 connection,
                 "model_predictions",
                 {
                     "prediction_id": f"prediction-{version}",
                     "model_version": version,
-                    "model_artifact_hash": "a" * 64,
-                    "model_spec_hash": "b" * 64,
+                    "model_artifact_hash": policy["artifact_hash"],
+                    "model_spec_hash": policy["spec_hash"],
                     "policy_hash": _hash(policy_bytes),
                     "git_commit": "c" * 40,
                     "snapshot_id": SNAPSHOT_ID,
@@ -276,17 +328,39 @@ def test_rejects_invalid_snapshot_id(source) -> None:
         load_validated_snapshot(db_path, root, "../not-a-uuid")
 
 
+def test_rejects_prediction_without_matching_paired_quote(source) -> None:
+    db_path, root = source
+    with connect(Settings.for_root(root)) as connection:
+        connection.execute("DELETE FROM market_odds WHERE selection='AWAY'")
+        connection.commit()
+    with pytest.raises(ValueError, match="paired quote"):
+        load_validated_snapshot(db_path, root, SNAPSHOT_ID)
+
+
+def test_rejects_tampered_frozen_artifact(source) -> None:
+    db_path, root = source
+    artifact = root / "artifacts" / "models" / "1.1.2" / "candidate.joblib"
+    artifact.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="artifact"):
+        load_validated_snapshot(db_path, root, SNAPSHOT_ID)
+
+
 def test_mixed_week_board_exports_only_earliest_week(source) -> None:
     db_path, root = source
     with connect(Settings.for_root(root)) as connection:
         game = dict(connection.execute("SELECT * FROM games WHERE game_id='game-1'").fetchone())
         game.update(game_id="game-2", week=4, kickoff_utc="2026-10-04T17:00:00Z")
         _insert(connection, "games", game)
+        for row in connection.execute("SELECT * FROM market_odds").fetchall():
+            quote = dict(row)
+            quote.update(game_id="game-2", provider_event_id="event-2")
+            _insert(connection, "market_odds", quote)
         for row in connection.execute("SELECT * FROM model_predictions").fetchall():
             prediction = dict(row)
             prediction.update(
                 prediction_id=prediction["prediction_id"] + "-week4",
                 game_id="game-2",
+                provider_event_id="event-2",
                 week=4,
                 kickoff_utc="2026-10-04T17:00:00Z",
             )
@@ -300,3 +374,87 @@ def test_mixed_week_board_exports_only_earliest_week(source) -> None:
     assert len(loaded["predictions"]) == 2
     assert loaded["games"][0]["week"] == 3
     assert loaded["excluded_future_week_rows"] == 2
+
+
+def test_packet_has_separate_pass_only_lanes_and_no_outcomes(source) -> None:
+    db_path, root = source
+    packet = build_packet(
+        load_validated_snapshot(db_path, root, SNAPSHOT_ID), "2026-09-27T13:00:00Z"
+    )
+    assert packet["packet_version"] == "1.0.0"
+    assert packet["snapshot_id"] == SNAPSHOT_ID
+    assert packet["generated_at_utc"] == "2026-09-27T13:00:00Z"
+    assert packet["official_decision"] == "PASS"
+    assert packet["research_status"] == "RESEARCH_ONLY_UNWEIGHTED"
+    assert set(packet["lanes"]) == {"1.1.2", "challenger-0.2.0"}
+    assert all(
+        row["decision"] == "PASS" for lane in packet["lanes"].values() for row in lane
+    )
+    assert packet["games"][0]["game_id"] == "game-1"
+    assert "away_score" not in json.dumps(packet)
+    assert "profit_loss" not in json.dumps(packet)
+    assert "prospective_evaluations" not in json.dumps(packet)
+
+
+def test_publish_manifest_hash_and_immutable_rerun(source) -> None:
+    db_path, root = source
+    selected = load_validated_snapshot(db_path, root, SNAPSHOT_ID)
+    packet = build_packet(selected, "2026-09-27T13:00:00Z")
+    packet_path, manifest_path = publish_packet(packet, root)
+    initial_bytes = packet_path.read_bytes()
+    initial_mtime = packet_path.stat().st_mtime_ns
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["packet_sha256"] == _hash(initial_bytes)
+    assert manifest["snapshot_id"] == SNAPSHOT_ID
+    assert publish_packet(packet, root) == (packet_path, manifest_path)
+    assert packet_path.read_bytes() == initial_bytes
+    assert packet_path.stat().st_mtime_ns == initial_mtime
+    changed = {**packet, "generated_at_utc": "2026-09-27T13:01:00Z"}
+    with pytest.raises(ValueError, match="immutable"):
+        publish_packet(changed, root)
+
+
+def test_export_snapshot_is_read_only_and_idempotent(source) -> None:
+    db_path, root = source
+    with connect(Settings.for_root(root)) as connection:
+        before = connection.execute("SELECT COUNT(*) FROM api_requests").fetchone()[0]
+    packet_path, manifest_path = export_snapshot(
+        db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:00:00Z"
+    )
+    assert packet_path.is_file() and manifest_path.is_file()
+    assert export_snapshot(
+        db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:01:00Z"
+    ) == (packet_path, manifest_path)
+    with connect(Settings.for_root(root)) as connection:
+        after = connection.execute("SELECT COUNT(*) FROM api_requests").fetchone()[0]
+    assert (before, after) == (1, 1)
+
+
+def test_export_rejects_concurrent_operational_change(source, monkeypatch) -> None:
+    db_path, root = source
+    import scripts.export_interface_packet as module
+
+    original_loader = module.load_validated_snapshot
+
+    def concurrent_loader(db_path, root, snapshot_id):
+        selected = original_loader(db_path, root, snapshot_id)
+        with connect(Settings.for_root(root)) as connection:
+            _insert(
+                connection,
+                "api_requests",
+                {
+                    "request_id": "concurrent",
+                    "slot": "sunday_1245",
+                    "request_kind": "full-board",
+                    "week_bucket": "2026-09-21",
+                    "started_at_utc": "2026-09-27T13:00:00Z",
+                    "status": "IN_PROGRESS",
+                },
+            )
+            connection.commit()
+        return selected
+
+    monkeypatch.setattr(module, "load_validated_snapshot", concurrent_loader)
+    with pytest.raises(ValueError, match="operational state changed"):
+        export_snapshot(db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:00:00Z")
+    assert not list((root / "manifests" / "interface").rglob("*.json"))

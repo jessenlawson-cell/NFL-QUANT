@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -117,6 +119,21 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
                 version, expected_status
             ) or policy.get("allowed_decisions") != ["PASS"]:
                 raise ValueError(f"invalid policy identity for {version}")
+            development_path = root / "manifests" / f"model_{version}_development.json"
+            development = json.loads(development_path.read_text(encoding="utf-8"))
+            artifact_path = _within_root(root, str(development["artifact"]))
+            if not artifact_path.is_file() or _sha256(artifact_path) != policy["artifact_hash"]:
+                raise ValueError(f"frozen artifact hash mismatch for {version}")
+            spec_name = "MODEL_SPEC_V1_1.md" if version == "1.1.2" else "CHALLENGER_SPEC.md"
+            spec_bytes = (root / spec_name).read_bytes().replace(b"\r\n", b"\n")
+            if hashlib.sha256(spec_bytes).hexdigest() != policy["spec_hash"]:
+                raise ValueError(f"frozen specification hash mismatch for {version}")
+            if (
+                development.get("model_version") != version
+                or development.get("artifact_hash") != policy["artifact_hash"]
+                or development.get("spec_hash") != policy["spec_hash"]
+            ):
+                raise ValueError(f"development manifest identity mismatch for {version}")
             policies[version] = {
                 "model_version": version,
                 "status": expected_status,
@@ -133,6 +150,22 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
             "AND model_version IN (?,?) ORDER BY model_version,game_id,market,prediction_id",
             (snapshot_id, *MODEL_VERSIONS),
         )
+        quote_rows = _rows(
+            connection,
+            "SELECT snapshot_id,provider_event_id,game_id,bookmaker_key,market,selection,"
+            "canonical_line,american_price,vig_free_probability,last_update_utc,"
+            "source_updated_at_utc FROM market_odds WHERE snapshot_id=? "
+            "AND bookmaker_key='pinnacle'",
+            (snapshot_id,),
+        )
+        quotes: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for quote in quote_rows:
+            quote_key = (
+                str(quote["provider_event_id"]),
+                str(quote["game_id"]),
+                str(quote["market"]),
+            )
+            quotes.setdefault(quote_key, []).append(quote)
         if not predictions or {row["model_version"] for row in predictions} != set(MODEL_VERSIONS):
             raise ValueError("both frozen prediction versions are required")
         keys: set[tuple[str, str, str]] = set()
@@ -181,6 +214,43 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
                 )
                 if any(row[field] is None for field in required):
                     raise ValueError("eligible prediction has missing probability or price")
+                quote_key = (
+                    str(row["provider_event_id"]),
+                    str(row["game_id"]),
+                    str(row["market"]),
+                )
+                paired = quotes.get(quote_key, [])
+                opposite = "AWAY" if row["orientation"] == "HOME" else "UNDER"
+                if len(paired) != 2 or {q["selection"] for q in paired} != {
+                    row["orientation"], opposite
+                }:
+                    raise ValueError("paired quote missing or ambiguous")
+                by_selection = {str(q["selection"]): q for q in paired}
+                oriented = by_selection[str(row["orientation"])]
+                other = by_selection[opposite]
+                if (
+                    oriented["canonical_line"] != row["pinnacle_line"]
+                    or other["canonical_line"] != row["pinnacle_line"]
+                    or oriented["american_price"] != row["pinnacle_orientation_price"]
+                    or other["american_price"] != row["pinnacle_other_price"]
+                    or abs(
+                        float(oriented["vig_free_probability"])
+                        - float(row["pinnacle_orientation_no_vig_probability"])
+                    ) > 1e-9
+                ):
+                    raise ValueError("paired quote differs from persisted prediction")
+                update_times = [
+                    _utc(q["source_updated_at_utc"] or q["last_update_utc"], "quote")
+                    for q in paired
+                ]
+                if (
+                    max(update_times) != _utc(row["pinnacle_updated_at_utc"], "quote")
+                    or min(update_times)
+                    < snapshot_time
+                    - timedelta(minutes=int(policy_identity["quote_max_age_minutes"]))
+                    or max(update_times) > snapshot_time
+                ):
+                    raise ValueError("paired quote has invalid timestamp")
 
         game_columns = ",".join(GAME_FIELDS)
         games = _rows(
@@ -247,3 +317,208 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
         }
     finally:
         connection.close()
+
+
+def _json_bytes(value: dict[str, Any]) -> bytes:
+    serialized = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return (serialized + "\n").encode("utf-8")
+
+
+def build_packet(source: dict[str, Any], generated_at_utc: str) -> dict[str, Any]:
+    """Construct a deterministic, scoreless weekly view of the frozen records."""
+    generated = _utc(generated_at_utc, "generation")
+    snapshot = source["snapshot"]
+    decision = _utc(snapshot["retrieved_at_utc"], "snapshot")
+    if generated < decision:
+        raise ValueError("packet generation predates decision")
+    games = source["games"]
+    if not games:
+        raise ValueError("packet requires pregame games")
+    season, week = games[0]["season"], games[0]["week"]
+    if any((game["season"], game["week"]) != (season, week) for game in games):
+        raise ValueError("packet contains mixed weeks")
+    lanes = {
+        version: [
+            row for row in source["predictions"] if row["model_version"] == version
+        ]
+        for version in MODEL_VERSIONS
+    }
+    if any(not rows for rows in lanes.values()):
+        raise ValueError("packet requires both frozen lanes")
+    packet: dict[str, Any] = {
+        "packet_version": "1.0.0",
+        "snapshot_id": snapshot["snapshot_id"],
+        "season": season,
+        "week": week,
+        "generated_at_utc": generated_at_utc,
+        "decision_as_of_utc": snapshot["retrieved_at_utc"],
+        "official_decision": "PASS",
+        "research_status": "RESEARCH_ONLY_UNWEIGHTED",
+        "source": {
+            "raw_snapshot": snapshot,
+            "request": source["request"],
+            "challenger_report": source["challenger_report"],
+            "frozen_policies": source["policies"],
+        },
+        "games": games,
+        "lanes": lanes,
+        "row_counts": {version: len(rows) for version, rows in lanes.items()},
+        "excluded_future_week_rows": source["excluded_future_week_rows"],
+    }
+    packet["payload_sha256"] = hashlib.sha256(_json_bytes(packet)).hexdigest()
+    return packet
+
+
+def _atomic_new_file(path: Path, content: bytes) -> None:
+    """Link a complete temporary file into place without replacing any existing evidence."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4()}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_bytes() != content:
+                raise ValueError(f"immutable interface evidence differs: {path}") from None
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def publish_packet(packet: dict[str, Any], root: Path) -> tuple[Path, Path]:
+    """Publish packet first and manifest last; manifest marks a complete export."""
+    snapshot_id = str(packet["snapshot_id"])
+    if str(uuid.UUID(snapshot_id)) != snapshot_id:
+        raise ValueError("invalid snapshot ID")
+    bucket = f'{int(packet["season"])}-W{int(packet["week"])}'
+    packet_path = root / "reports" / "interface" / bucket / f"{snapshot_id}.json"
+    manifest_path = root / "manifests" / "interface" / bucket / f"{snapshot_id}.json"
+    packet_bytes = _json_bytes(packet)
+    packet_hash = hashlib.sha256(packet_bytes).hexdigest()
+    manifest = {
+        "manifest_version": "1.0.0",
+        "packet_version": packet["packet_version"],
+        "snapshot_id": snapshot_id,
+        "season": packet["season"],
+        "week": packet["week"],
+        "generated_at_utc": packet["generated_at_utc"],
+        "packet_path": str(packet_path.relative_to(root)).replace("\\", "/"),
+        "packet_sha256": packet_hash,
+        "byte_count": len(packet_bytes),
+        "status": "COMPLETE",
+    }
+    manifest_bytes = _json_bytes(manifest)
+    if manifest_path.exists():
+        if not packet_path.exists() or packet_path.read_bytes() != packet_bytes:
+            raise ValueError("immutable packet differs from completed manifest")
+        if manifest_path.read_bytes() != manifest_bytes:
+            raise ValueError("immutable manifest differs")
+        return packet_path, manifest_path
+    _atomic_new_file(packet_path, packet_bytes)
+    if packet_path.read_bytes() != packet_bytes:
+        raise ValueError("packet hash verification failed")
+    _atomic_new_file(manifest_path, manifest_bytes)
+    return packet_path, manifest_path
+
+
+def _protected_state(db_path: Path, root: Path, snapshot_id: str) -> dict[str, Any]:
+    """Fingerprint protected files and operational table sizes without any write."""
+    protected = [
+        root / "MODEL_SPEC_V1_1.md",
+        root / "CHALLENGER_SPEC.md",
+        root / "manifests" / "prospective_policy_1.1.2.json",
+        root / "manifests" / "prospective_policy_challenger-0.2.0.json",
+        root / "manifests" / "model_1.1.2_development.json",
+        root / "manifests" / "model_challenger-0.2.0_development.json",
+        root / "artifacts" / "models" / "1.1.2" / "candidate.joblib",
+        root / "artifacts" / "models" / "challenger-0.2.0" / "candidate.joblib",
+        root / "market_odds.csv",
+        root / "model_predictions.csv",
+        root / "reports" / f"challenger_challenger-0.2.0_{snapshot_id}.json",
+    ]
+    protected.extend(sorted((root / "src").rglob("*.py")))
+    hashes = {
+        str(path.relative_to(root)).replace("\\", "/"): _sha256(path)
+        for path in protected
+        if path.is_file()
+    }
+    connection = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        names = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+        counts = {name: connection.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+                  for name in names}
+        schema = [
+            tuple(row) for row in connection.execute(
+                "SELECT name,type,sql FROM sqlite_master ORDER BY type,name"
+            )
+        ]
+        connection.commit()
+    finally:
+        connection.close()
+    return {
+        "files": hashes,
+        "table_counts": counts,
+        "schema_sha256": hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest(),
+    }
+
+
+def export_snapshot(
+    db_path: Path, root: Path, snapshot_id: str, *, generated_at_utc: str | None = None
+) -> tuple[Path, Path]:
+    """Validate, publish, and prove that no protected state moved during the export."""
+    before = _protected_state(db_path, root, snapshot_id)
+    selected = load_validated_snapshot(db_path, root, snapshot_id)
+    if _protected_state(db_path, root, snapshot_id) != before:
+        raise ValueError("operational state changed during selection")
+    game = selected["games"][0]
+    path = (
+        root / "reports" / "interface" / f'{game["season"]}-W{game["week"]}'
+        / f"{snapshot_id}.json"
+    )
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            generated_at_utc = str(existing["generated_at_utc"])
+        except (KeyError, json.JSONDecodeError) as exc:
+            raise ValueError("immutable existing packet is malformed") from exc
+    packet = build_packet(
+        selected,
+        generated_at_utc or datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    )
+    if _protected_state(db_path, root, snapshot_id) != before:
+        raise ValueError("operational state changed before publication")
+    packet_path, manifest_path = publish_packet(packet, root)
+    if _protected_state(db_path, root, snapshot_id) != before:
+        manifest_path.unlink(missing_ok=True)
+        raise ValueError("operational state changed during publication")
+    return packet_path, manifest_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--snapshot-id", required=True)
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    packet_path, manifest_path = export_snapshot(
+        root / "data" / "runtime" / "nfl_bets.sqlite3", root, args.snapshot_id
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    print(json.dumps({
+        "packet": str(packet_path),
+        "manifest": str(manifest_path),
+        "packet_sha256": manifest["packet_sha256"],
+        "official_decision": "PASS",
+    }, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
