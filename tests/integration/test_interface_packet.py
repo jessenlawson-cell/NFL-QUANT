@@ -345,6 +345,17 @@ def test_rejects_tampered_frozen_artifact(source) -> None:
         load_validated_snapshot(db_path, root, SNAPSHOT_ID)
 
 
+def test_rejects_game_metadata_only_available_after_decision(source) -> None:
+    db_path, root = source
+    with connect(Settings.for_root(root)) as connection:
+        connection.execute(
+            "UPDATE games SET retrieved_at_utc='2026-09-27T12:46:00Z'"
+        )
+        connection.commit()
+    with pytest.raises(ValueError, match="game metadata"):
+        load_validated_snapshot(db_path, root, SNAPSHOT_ID)
+
+
 def test_mixed_week_board_exports_only_earliest_week(source) -> None:
     db_path, root = source
     with connect(Settings.for_root(root)) as connection:
@@ -455,6 +466,23 @@ def test_export_rejects_concurrent_operational_change(source, monkeypatch) -> No
         return selected
 
     monkeypatch.setattr(module, "load_validated_snapshot", concurrent_loader)
+    with pytest.raises(ValueError, match="operational state changed"):
+        export_snapshot(db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:00:00Z")
+    assert not list((root / "manifests" / "interface").rglob("*.json"))
+
+
+def test_export_rejects_raw_source_change_after_selection(source, monkeypatch) -> None:
+    db_path, root = source
+    import scripts.export_interface_packet as module
+
+    original_loader = module.load_validated_snapshot
+
+    def changing_loader(db_path, root, snapshot_id):
+        selected = original_loader(db_path, root, snapshot_id)
+        (root / "data" / "raw" / "board.json").write_bytes(b"changed-after-selection")
+        return selected
+
+    monkeypatch.setattr(module, "load_validated_snapshot", changing_loader)
     with pytest.raises(ValueError, match="operational state changed"):
         export_snapshot(db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:00:00Z")
     assert not list((root / "manifests" / "interface").rglob("*.json"))

@@ -252,7 +252,7 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
                 ):
                     raise ValueError("paired quote has invalid timestamp")
 
-        game_columns = ",".join(GAME_FIELDS)
+        game_columns = ",".join((*GAME_FIELDS, "retrieved_at_utc", "source_updated_at_utc"))
         games = _rows(
             connection,
             f"SELECT {game_columns} FROM games WHERE game_id IN "
@@ -262,6 +262,13 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
         if {str(game["game_id"]) for game in games} != game_ids:
             raise ValueError("unmatched game ID")
         game_map = {str(game["game_id"]): game for game in games}
+        for game in games:
+            if _utc(game["retrieved_at_utc"], "game metadata") > snapshot_time:
+                raise ValueError("game metadata retrieved after decision")
+            if game["source_updated_at_utc"] is not None and (
+                _utc(game["source_updated_at_utc"], "game metadata") > snapshot_time
+            ):
+                raise ValueError("game metadata updated after decision")
         for row in predictions:
             game = game_map[str(row["game_id"])]
             if (row["season"], row["week"], row["kickoff_utc"]) != (
@@ -289,7 +296,7 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
             raise ValueError("challenger report time outside pregame window")
         selected_season_week = min((game["season"], game["week"]) for game in games)
         selected_games = [
-            game for game in games
+            {field: game[field] for field in GAME_FIELDS} for game in games
             if (game["season"], game["week"]) == selected_season_week
         ]
         selected_ids = {str(game["game_id"]) for game in selected_games}
@@ -448,6 +455,10 @@ def _protected_state(db_path: Path, root: Path, snapshot_id: str) -> dict[str, A
     try:
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")
+        raw_row = connection.execute(
+            "SELECT path,headers_path FROM raw_snapshots WHERE snapshot_id=?", (snapshot_id,)
+        ).fetchone()
+        raw_paths = tuple(value for value in raw_row if value) if raw_row else ()
         names = [
             str(row[0])
             for row in connection.execute(
@@ -464,6 +475,11 @@ def _protected_state(db_path: Path, root: Path, snapshot_id: str) -> dict[str, A
         connection.commit()
     finally:
         connection.close()
+    for raw_value in raw_paths:
+        raw_path = _within_root(root, str(raw_value))
+        if not raw_path.is_file():
+            raise ValueError("operational raw source disappeared")
+        hashes[str(raw_path.relative_to(root)).replace("\\", "/")] = _sha256(raw_path)
     return {
         "files": hashes,
         "table_counts": counts,
