@@ -458,3 +458,35 @@ def test_export_rejects_concurrent_operational_change(source, monkeypatch) -> No
     with pytest.raises(ValueError, match="operational state changed"):
         export_snapshot(db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:00:00Z")
     assert not list((root / "manifests" / "interface").rglob("*.json"))
+
+
+def test_project_instructions_define_pass_only_interface_contract() -> None:
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "docs" / "interface" / "NFL_QUANT_PROJECT_INSTRUCTIONS.md"
+    )
+    instructions = path.read_text(encoding="utf-8")
+    assert len(instructions) < 8_000
+    for required in (
+        "PASS",
+        "RESEARCH_ONLY_UNWEIGHTED",
+        "snapshot_id",
+        "Python",
+        "no model rerun",
+        "calibrated_non_push_win_probability",
+        "pinnacle_orientation_no_vig_probability",
+        "model_win_probability",
+        "Frozen model record",
+        "Exploratory interface interpretation",
+    ):
+        assert required in instructions
+    assert "never compare model_win_probability" in instructions
+    assert "Never give a stake" in instructions
+
+
+def test_weekly_prompt_requires_validated_packet_and_as_of_cutoff() -> None:
+    path = Path(__file__).resolve().parents[2] / "docs" / "interface" / "WEEKLY_PROMPT.md"
+    prompt = path.read_text(encoding="utf-8")
+    assert "packet" in prompt.lower()
+    assert "snapshot_id" in prompt
+    assert "as-of cutoff" in prompt
