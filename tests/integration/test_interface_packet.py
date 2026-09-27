@@ -8,6 +8,7 @@ import pytest
 
 from nfl_bets.config import Settings
 from nfl_bets.db import connect, initialize_database
+from nfl_bets.util import canonical_hash
 from scripts.export_interface_packet import (
     build_packet,
     export_snapshot,
@@ -32,13 +33,46 @@ def _insert(connection, table: str, values: dict) -> None:
     )
 
 
+def _all_columns(connection, table: str, values: dict) -> dict:
+    columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+    return {name: values.get(name) for name in columns}
+
+
 @pytest.fixture
 def source(tmp_path: Path) -> tuple[Path, Path]:
     settings = Settings.for_root(tmp_path)
     initialize_database(settings)
     raw = tmp_path / "data" / "raw" / "board.json"
     raw.parent.mkdir(parents=True)
-    raw.write_bytes(b'{"fixture":"board"}')
+    raw.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "event-1",
+                    "commence_time": KICKOFF,
+                    "home_team": "Fixture Home",
+                    "away_team": "Fixture Away",
+                    "bookmakers": [
+                        {
+                            "key": "pinnacle",
+                            "last_update": "2026-09-27T12:40:00Z",
+                            "markets": [
+                                {
+                                    "key": "spreads",
+                                    "last_update": "2026-09-27T12:40:00Z",
+                                    "outcomes": [
+                                        {"name": "Fixture Home", "price": -110, "point": 3.5},
+                                        {"name": "Fixture Away", "price": -110, "point": -3.5},
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
     manifests = tmp_path / "manifests"
     manifests.mkdir(exist_ok=True)
     for version, status in (
@@ -143,10 +177,7 @@ def source(tmp_path: Path) -> tuple[Path, Path]:
             },
         )
         for selection in ("HOME", "AWAY"):
-            _insert(
-                connection,
-                "market_odds",
-                {
+            quote = {
                     "snapshot_id": SNAPSHOT_ID,
                     "provider_event_id": "event-1",
                     "game_id": "game-1",
@@ -156,7 +187,7 @@ def source(tmp_path: Path) -> tuple[Path, Path]:
                     "bookmaker_group": "anchor",
                     "market": "spreads",
                     "selection": selection,
-                    "point": -3.5 if selection == "HOME" else 3.5,
+                    "point": 3.5 if selection == "HOME" else -3.5,
                     "canonical_line": -3.5,
                     "american_price": -110,
                     "decimal_price": 1.909090909,
@@ -164,21 +195,20 @@ def source(tmp_path: Path) -> tuple[Path, Path]:
                     "vig_free_probability": 0.5,
                     "overround": 0.0476190476,
                     "last_update_utc": "2026-09-27T12:40:00Z",
+                    "source_updated_at_utc": "2026-09-27T12:40:00Z",
                     "source": "fixture",
                     "retrieved_at_utc": SNAPSHOT_TIME,
                     "schema_version": "1.1.0",
-                    "content_hash": f"quote-{selection}",
-                },
-            )
+                }
+            quote = _all_columns(connection, "market_odds", quote)
+            quote["content_hash"] = canonical_hash(quote)
+            _insert(connection, "market_odds", quote)
         for version in ("1.1.2", "challenger-0.2.0"):
             policy_bytes = (
                 manifests / f"prospective_policy_{version}.json"
             ).read_bytes()
             policy = json.loads(policy_bytes)
-            _insert(
-                connection,
-                "model_predictions",
-                {
+            prediction = {
                     "prediction_id": f"prediction-{version}",
                     "model_version": version,
                     "model_artifact_hash": policy["artifact_hash"],
@@ -204,9 +234,9 @@ def source(tmp_path: Path) -> tuple[Path, Path]:
                     "pinnacle_other_price": -110,
                     "pinnacle_orientation_no_vig_probability": 0.5,
                     "calibrated_non_push_win_probability": 0.54,
-                    "model_win_probability": 0.52,
+                    "model_win_probability": 0.5184,
                     "model_push_probability": 0.04,
-                    "model_loss_probability": 0.44,
+                    "model_loss_probability": 0.4416,
                     "retail_books_count": 0,
                     "uncertainty_status": "SHADOW_ONLY",
                     "eligibility_status": "SHADOW_ELIGIBLE",
@@ -215,9 +245,10 @@ def source(tmp_path: Path) -> tuple[Path, Path]:
                     "source": "fixture",
                     "retrieved_at_utc": "2026-09-27T12:46:00Z",
                     "schema_version": "1.1.0",
-                    "content_hash": f"content-{version}",
-                },
-            )
+                }
+            prediction = _all_columns(connection, "model_predictions", prediction)
+            prediction["content_hash"] = canonical_hash(prediction)
+            _insert(connection, "model_predictions", prediction)
         connection.commit()
     return settings.db_path, tmp_path
 
@@ -254,6 +285,15 @@ def test_ineligible_null_probabilities_remain_null(source) -> None:
             "pinnacle_orientation_no_vig_probability=NULL, "
             "pinnacle_orientation_price=NULL, pinnacle_other_price=NULL "
             "WHERE model_version='challenger-0.2.0'"
+        )
+        row = dict(
+            connection.execute(
+                "SELECT * FROM model_predictions WHERE model_version='challenger-0.2.0'"
+            ).fetchone()
+        )
+        connection.execute(
+            "UPDATE model_predictions SET content_hash=? WHERE model_version='challenger-0.2.0'",
+            (canonical_hash(row),),
         )
         connection.commit()
     loaded = load_validated_snapshot(db_path, root, SNAPSHOT_ID)
@@ -356,15 +396,86 @@ def test_rejects_game_metadata_only_available_after_decision(source) -> None:
         load_validated_snapshot(db_path, root, SNAPSHOT_ID)
 
 
-def test_mixed_week_board_exports_only_earliest_week(source) -> None:
+def test_rejects_changed_prediction_content_with_stale_hash(source) -> None:
     db_path, root = source
     with connect(Settings.for_root(root)) as connection:
+        connection.execute(
+            "UPDATE model_predictions SET calibrated_non_push_win_probability=0.51 "
+            "WHERE model_version='challenger-0.2.0'"
+        )
+        connection.commit()
+    with pytest.raises(ValueError, match="content hash"):
+        load_validated_snapshot(db_path, root, SNAPSHOT_ID)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("calibrated_non_push_win_probability", 1.5),
+        ("model_loss_probability", None),
+        ("model_push_probability", -0.1),
+    ],
+)
+def test_rejects_invalid_eligible_probability(source, field: str, value) -> None:
+    db_path, root = source
+    with connect(Settings.for_root(root)) as connection:
+        connection.execute(
+            f"UPDATE model_predictions SET {field}=? WHERE model_version='challenger-0.2.0'",
+            (value,),
+        )
+        row = dict(
+            connection.execute(
+                "SELECT * FROM model_predictions WHERE model_version='challenger-0.2.0'"
+            ).fetchone()
+        )
+        connection.execute(
+            "UPDATE model_predictions SET content_hash=? WHERE model_version='challenger-0.2.0'",
+            (canonical_hash(row),),
+        )
+        connection.commit()
+    with pytest.raises(ValueError, match="eligible probability"):
+        load_validated_snapshot(db_path, root, SNAPSHOT_ID)
+
+
+def test_rejects_raw_quote_mismatch_even_with_updated_raw_hash(source) -> None:
+    db_path, root = source
+    raw = root / "data" / "raw" / "board.json"
+    payload = json.loads(raw.read_text(encoding="utf-8"))
+    payload[0]["bookmakers"][0]["markets"][0]["outcomes"][0]["price"] = -115
+    raw.write_text(json.dumps(payload), encoding="utf-8")
+    with connect(Settings.for_root(root)) as connection:
+        connection.execute("DROP TRIGGER immutable_decision_close_snapshot_update")
+        connection.execute(
+            "UPDATE raw_snapshots SET content_hash=?,byte_count=? WHERE snapshot_id=?",
+            (_hash(raw.read_bytes()), raw.stat().st_size, SNAPSHOT_ID),
+        )
+        connection.commit()
+    with pytest.raises(ValueError, match="raw quote"):
+        load_validated_snapshot(db_path, root, SNAPSHOT_ID)
+
+
+def test_mixed_week_board_exports_only_earliest_week(source) -> None:
+    db_path, root = source
+    raw = root / "data" / "raw" / "board.json"
+    raw_events = json.loads(raw.read_text(encoding="utf-8"))
+    week_four_event = json.loads(json.dumps(raw_events[0]))
+    week_four_event["id"] = "event-2"
+    week_four_event["commence_time"] = "2026-10-04T17:00:00Z"
+    raw_events.append(week_four_event)
+    raw.write_text(json.dumps(raw_events), encoding="utf-8")
+    with connect(Settings.for_root(root)) as connection:
+        connection.execute("DROP TRIGGER immutable_decision_close_snapshot_update")
+        connection.execute(
+            "UPDATE raw_snapshots SET content_hash=?,byte_count=? WHERE snapshot_id=?",
+            (_hash(raw.read_bytes()), raw.stat().st_size, SNAPSHOT_ID),
+        )
         game = dict(connection.execute("SELECT * FROM games WHERE game_id='game-1'").fetchone())
         game.update(game_id="game-2", week=4, kickoff_utc="2026-10-04T17:00:00Z")
         _insert(connection, "games", game)
         for row in connection.execute("SELECT * FROM market_odds").fetchall():
             quote = dict(row)
             quote.update(game_id="game-2", provider_event_id="event-2")
+            quote["content_hash"] = canonical_hash(quote)
             _insert(connection, "market_odds", quote)
         for row in connection.execute("SELECT * FROM model_predictions").fetchall():
             prediction = dict(row)
@@ -375,6 +486,7 @@ def test_mixed_week_board_exports_only_earliest_week(source) -> None:
                 week=4,
                 kickoff_utc="2026-10-04T17:00:00Z",
             )
+            prediction["content_hash"] = canonical_hash(prediction)
             _insert(connection, "model_predictions", prediction)
         connection.commit()
     report = root / "reports" / f"challenger_challenger-0.2.0_{SNAPSHOT_ID}.json"
@@ -466,6 +578,25 @@ def test_export_rejects_concurrent_operational_change(source, monkeypatch) -> No
         return selected
 
     monkeypatch.setattr(module, "load_validated_snapshot", concurrent_loader)
+    with pytest.raises(ValueError, match="operational state changed"):
+        export_snapshot(db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:00:00Z")
+    assert not list((root / "manifests" / "interface").rglob("*.json"))
+
+
+def test_export_rejects_same_count_database_update(source, monkeypatch) -> None:
+    db_path, root = source
+    import scripts.export_interface_packet as module
+
+    original_loader = module.load_validated_snapshot
+
+    def changing_loader(db_path, root, snapshot_id):
+        selected = original_loader(db_path, root, snapshot_id)
+        with connect(Settings.for_root(root)) as connection:
+            connection.execute("UPDATE games SET home_team='CHANGED' WHERE game_id='game-1'")
+            connection.commit()
+        return selected
+
+    monkeypatch.setattr(module, "load_validated_snapshot", changing_loader)
     with pytest.raises(ValueError, match="operational state changed"):
         export_snapshot(db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:00:00Z")
     assert not list((root / "manifests" / "interface").rglob("*.json"))

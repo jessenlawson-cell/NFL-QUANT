@@ -5,12 +5,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from nfl_bets.util import canonical_hash
 
 MODEL_VERSIONS = ("1.1.2", "challenger-0.2.0")
 PREDICTION_FIELDS = (
@@ -62,6 +65,42 @@ def _rows(
     return [dict(row) for row in connection.execute(query, params)]
 
 
+def _raw_contracts(path: Path) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """Index source prices by native event/book/market IDs, never by names."""
+    payload = json.loads(path.read_bytes())
+    if not isinstance(payload, list):
+        raise ValueError("raw quote board is not an array")
+    contracts: dict[tuple[str, str, str], dict[str, Any]] = {}
+    event_ids: set[str] = set()
+    for event in payload:
+        event_id = str(event["id"])
+        if event_id in event_ids:
+            raise ValueError("duplicate raw provider event ID")
+        event_ids.add(event_id)
+        for bookmaker in event.get("bookmakers", []):
+            if bookmaker.get("key") != "pinnacle":
+                continue
+            for market in bookmaker.get("markets", []):
+                market_key = str(market.get("key"))
+                if market_key not in {"spreads", "totals"}:
+                    continue
+                key = (event_id, "pinnacle", market_key)
+                if key in contracts:
+                    raise ValueError("duplicate raw quote contract")
+                outcomes = market.get("outcomes", [])
+                if len(outcomes) != 2:
+                    raise ValueError("raw quote is not paired")
+                contracts[key] = {
+                    "commence_time": event["commence_time"],
+                    "updated_at": market.get("last_update") or bookmaker.get("last_update"),
+                    "price_points": sorted(
+                        (int(outcome["price"]), float(outcome["point"]))
+                        for outcome in outcomes
+                    ),
+                }
+    return contracts
+
+
 def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict[str, Any]:
     """Select one pregame decision board, with no database or operational writes."""
     try:
@@ -106,6 +145,7 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
             headers_path = _within_root(root, str(snapshot["headers_path"]))
             if not headers_path.is_file():
                 raise ValueError("raw snapshot headers missing")
+        raw_contracts = _raw_contracts(raw_path)
 
         policies: dict[str, dict[str, Any]] = {}
         for version, expected_status in (
@@ -152,10 +192,7 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
         )
         quote_rows = _rows(
             connection,
-            "SELECT snapshot_id,provider_event_id,game_id,bookmaker_key,market,selection,"
-            "canonical_line,american_price,vig_free_probability,last_update_utc,"
-            "source_updated_at_utc FROM market_odds WHERE snapshot_id=? "
-            "AND bookmaker_key='pinnacle'",
+            "SELECT * FROM market_odds WHERE snapshot_id=? AND bookmaker_key='pinnacle'",
             (snapshot_id,),
         )
         quotes: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
@@ -168,6 +205,12 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
             quotes.setdefault(quote_key, []).append(quote)
         if not predictions or {row["model_version"] for row in predictions} != set(MODEL_VERSIONS):
             raise ValueError("both frozen prediction versions are required")
+        duplicate_keys = [
+            (str(row["model_version"]), str(row["game_id"]), str(row["market"]))
+            for row in predictions
+        ]
+        if len(set(duplicate_keys)) != len(duplicate_keys):
+            raise ValueError("duplicate game-market-version prediction")
         keys: set[tuple[str, str, str]] = set()
         game_ids: set[str] = set()
         for row in predictions:
@@ -205,15 +248,42 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
                 max_age = timedelta(minutes=int(policy_identity["quote_max_age_minutes"]))
                 if not snapshot_time - max_age <= quote_time <= snapshot_time:
                     raise ValueError("quote outside pre-decision freshness window")
+            if canonical_hash(row) != row["content_hash"]:
+                raise ValueError("prediction content hash mismatch")
             if row["eligibility_status"] == "SHADOW_ELIGIBLE":
                 required = (
                     "feature_as_of_utc", "pinnacle_updated_at_utc", "pinnacle_line",
                     "pinnacle_orientation_price", "pinnacle_other_price",
                     "pinnacle_orientation_no_vig_probability",
-                    "calibrated_non_push_win_probability", "model_push_probability",
+                    "calibrated_non_push_win_probability", "model_win_probability",
+                    "model_push_probability", "model_loss_probability",
                 )
                 if any(row[field] is None for field in required):
-                    raise ValueError("eligible prediction has missing probability or price")
+                    raise ValueError("eligible probability or price is missing")
+                numeric_probabilities = (
+                    "pinnacle_orientation_no_vig_probability",
+                    "calibrated_non_push_win_probability",
+                    "model_win_probability",
+                    "model_push_probability",
+                    "model_loss_probability",
+                )
+                probabilities = {field: float(row[field]) for field in numeric_probabilities}
+                market_p = probabilities["pinnacle_orientation_no_vig_probability"]
+                conditional = probabilities["calibrated_non_push_win_probability"]
+                win = probabilities["model_win_probability"]
+                push = probabilities["model_push_probability"]
+                loss = probabilities["model_loss_probability"]
+                if (
+                    any(not math.isfinite(value) for value in probabilities.values())
+                    or not 0 < market_p < 1
+                    or not 0 < conditional < 1
+                    or not 0 <= push < 1
+                    or not 0 <= win <= 1
+                    or not 0 <= loss <= 1
+                    or abs(win + push + loss - 1) > 1e-8
+                    or abs(win - (1 - push) * conditional) > 1e-8
+                ):
+                    raise ValueError("eligible probability is invalid or inconsistent")
                 quote_key = (
                     str(row["provider_event_id"]),
                     str(row["game_id"]),
@@ -225,6 +295,8 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
                     row["orientation"], opposite
                 }:
                     raise ValueError("paired quote missing or ambiguous")
+                if any(canonical_hash(quote) != quote["content_hash"] for quote in paired):
+                    raise ValueError("paired quote content hash mismatch")
                 by_selection = {str(q["selection"]): q for q in paired}
                 oriented = by_selection[str(row["orientation"])]
                 other = by_selection[opposite]
@@ -251,6 +323,18 @@ def load_validated_snapshot(db_path: Path, root: Path, snapshot_id: str) -> dict
                     or max(update_times) > snapshot_time
                 ):
                     raise ValueError("paired quote has invalid timestamp")
+                raw_contract = raw_contracts.get((quote_key[0], "pinnacle", quote_key[2]))
+                if raw_contract is None or raw_contract["price_points"] != sorted(
+                    (int(quote["american_price"]), float(quote["point"]))
+                    for quote in paired
+                ):
+                    raise ValueError("raw quote differs from persisted pair")
+                if (
+                    _utc(raw_contract["commence_time"], "raw quote kickoff") != kickoff
+                    or _utc(raw_contract["updated_at"], "raw quote update")
+                    != max(update_times)
+                ):
+                    raise ValueError("raw quote timestamp differs")
 
         game_columns = ",".join((*GAME_FIELDS, "retrieved_at_utc", "source_updated_at_utc"))
         games = _rows(
@@ -472,6 +556,31 @@ def _protected_state(db_path: Path, root: Path, snapshot_id: str) -> dict[str, A
                 "SELECT name,type,sql FROM sqlite_master ORDER BY type,name"
             )
         ]
+        relevant_queries = (
+            ("raw_snapshots", "SELECT * FROM raw_snapshots WHERE snapshot_id=? ORDER BY rowid"),
+            ("api_requests", "SELECT * FROM api_requests WHERE raw_snapshot_id=? ORDER BY rowid"),
+            ("market_odds", "SELECT * FROM market_odds WHERE snapshot_id=? ORDER BY rowid"),
+            (
+                "model_predictions",
+                "SELECT * FROM model_predictions WHERE snapshot_id=? ORDER BY rowid",
+            ),
+            (
+                "games",
+                "SELECT * FROM games WHERE game_id IN "
+                "(SELECT DISTINCT game_id FROM model_predictions WHERE snapshot_id=?) "
+                "ORDER BY rowid",
+            ),
+        )
+        relevant_hashes = {
+            label: hashlib.sha256(
+                json.dumps(
+                    [tuple(row) for row in connection.execute(query, (snapshot_id,))],
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            for label, query in relevant_queries
+        }
         connection.commit()
     finally:
         connection.close()
@@ -483,6 +592,7 @@ def _protected_state(db_path: Path, root: Path, snapshot_id: str) -> dict[str, A
     return {
         "files": hashes,
         "table_counts": counts,
+        "relevant_rows": relevant_hashes,
         "schema_sha256": hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest(),
     }
 
