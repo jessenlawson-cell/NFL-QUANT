@@ -488,6 +488,40 @@ def test_export_rejects_raw_source_change_after_selection(source, monkeypatch) -
     assert not list((root / "manifests" / "interface").rglob("*.json"))
 
 
+def test_late_drift_does_not_delete_prior_completed_manifest(source, monkeypatch) -> None:
+    db_path, root = source
+    _, manifest_path = export_snapshot(
+        db_path, root, SNAPSHOT_ID, generated_at_utc="2026-09-27T13:00:00Z"
+    )
+    original_manifest = manifest_path.read_bytes()
+    import scripts.export_interface_packet as module
+
+    original_publish = module.publish_packet
+
+    def concurrent_publish(packet, root):
+        result = original_publish(packet, root)
+        with connect(Settings.for_root(root)) as connection:
+            _insert(
+                connection,
+                "api_requests",
+                {
+                    "request_id": "late-concurrent",
+                    "slot": "sunday_1245",
+                    "request_kind": "full-board",
+                    "week_bucket": "2026-09-21",
+                    "started_at_utc": "2026-09-27T13:01:00Z",
+                    "status": "IN_PROGRESS",
+                },
+            )
+            connection.commit()
+        return result
+
+    monkeypatch.setattr(module, "publish_packet", concurrent_publish)
+    with pytest.raises(ValueError, match="operational state changed"):
+        export_snapshot(db_path, root, SNAPSHOT_ID)
+    assert manifest_path.read_bytes() == original_manifest
+
+
 def test_project_instructions_define_pass_only_interface_contract() -> None:
     path = (
         Path(__file__).resolve().parents[2]

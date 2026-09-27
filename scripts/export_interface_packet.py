@@ -512,9 +512,15 @@ def export_snapshot(
     )
     if _protected_state(db_path, root, snapshot_id) != before:
         raise ValueError("operational state changed before publication")
+    expected_manifest = (
+        root / "manifests" / "interface" / f'{game["season"]}-W{game["week"]}'
+        / f"{snapshot_id}.json"
+    )
+    manifest_existed = expected_manifest.is_file()
     packet_path, manifest_path = publish_packet(packet, root)
     if _protected_state(db_path, root, snapshot_id) != before:
-        manifest_path.unlink(missing_ok=True)
+        if not manifest_existed:
+            manifest_path.unlink(missing_ok=True)
         raise ValueError("operational state changed during publication")
     return packet_path, manifest_path
 
