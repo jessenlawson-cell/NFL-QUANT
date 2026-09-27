@@ -11,12 +11,19 @@ evaluation program. A separate ChatGPT Project receives a point-in-time,
 read-only packet for each weekly chat so it can interpret persisted model
 outputs and discuss exploratory model-derived suggestions without rerunning,
 retraining, or changing either model. The interface cannot present its own
-suggestion as an official model decision or validated market edge.
+suggestion as an official model decision or validated market edge, but presents suggestions at the risk of having insufficient evidence through week 8.
 
 Success means a user can ask what a frozen prediction says, what data and
 price it used, and why a model-derived interpretation is tentative. The
 answer must come from the packet and the already uploaded specifications and
 source code, never from team-name narratives or unverified web commentary.
+
+The user may request exploratory suggestions derived from persisted, weighted
+`1.1.2` and `challenger-0.2.0` outputs when validated pregame evidence supports
+them. The interface identifies the exact DECISION snapshot, preserves every
+official `PASS` decision, and says when no suggestion is supported. These
+suggestions do not change the ongoing repository or evidence engine, and the
+user understands that prospective model effectiveness remains unproven.
 
 ## Choice of approach
 
