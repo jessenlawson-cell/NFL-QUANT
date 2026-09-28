@@ -1,4 +1,9 @@
 # 2026 PROJECT STATE
+
+## Workflow direction reviewed 2026-09-28
+
+The user requested a capture-only evidence / conversational stress-test interface, not further predictive-model development. The committed interface plan is not proof of cutover; no scheduler, capture, model, or betting behavior is changed by this workflow cleanup. The implemented-state records below are retained as historical/current-system evidence and need revalidation before operational use.
+
 - **Canonical Workspace:** `C:\DEVELOPMENT\NFL QUANT`
 - **Current Season:** 2026
 - **Current Week:** 2
