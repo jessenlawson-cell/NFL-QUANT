@@ -1,5 +1,10 @@
-# NFL betting research kickoff
-For [date/slate], find up to [number] of the strongest NFL betting opportunities available at [sportsbook/region, if relevant]. Research current prices and football evidence. Rank bets by the strength of their price-sensitive case, not just likelihood of winning.
+# NFL market-intelligence kickoff
+For [date/slate], use the uploaded weekly_handoff_*.json and current football evidence
+to stress-test opportunities at bet365 Ontario. Check individual quote times, missed games,
+unresolved captures and missing markets; do not treat packet generation time as quote time.
+Ask for actual target-book quotes if absent. Choose market-specific references, not a universal
+sharp anchor. Explain price differences and dependencies; do not invent EV, calibrated forecasts,
+real-time steam or joint parlay probabilities. Old frozen/PASS-only rules are historical.
 
 For each, state selection, line/odds/book/as-of, supporting case, strongest objection, uncertainty, and what would invalidate it. Give fewer picks if fewer are supported. If a price is not verified, label it conditional. No stakes, invented edge, or requirement for a frozen-model packet.
 

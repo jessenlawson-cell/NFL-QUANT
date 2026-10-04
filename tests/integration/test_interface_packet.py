@@ -653,33 +653,12 @@ def test_late_drift_does_not_delete_prior_completed_manifest(source, monkeypatch
     assert manifest_path.read_bytes() == original_manifest
 
 
-def test_project_instructions_define_pass_only_interface_contract() -> None:
+def test_current_project_instructions_fit_chatgpt_upload_limit() -> None:
     path = (
         Path(__file__).resolve().parents[2]
         / "docs" / "interface" / "NFL_QUANT_PROJECT_INSTRUCTIONS.md"
     )
     instructions = path.read_text(encoding="utf-8")
-    assert len(instructions) < 8_000
-    for required in (
-        "PASS",
-        "RESEARCH_ONLY_UNWEIGHTED",
-        "snapshot_id",
-        "Python",
-        "no model rerun",
-        "calibrated_non_push_win_probability",
-        "pinnacle_orientation_no_vig_probability",
-        "model_win_probability",
-        "Frozen model record",
-        "Exploratory interface interpretation",
-    ):
-        assert required in instructions
-    assert "never compare model_win_probability" in instructions
-    assert "Never give a stake" in instructions
-
-
-def test_weekly_prompt_requires_validated_packet_and_as_of_cutoff() -> None:
-    path = Path(__file__).resolve().parents[2] / "docs" / "interface" / "WEEKLY_PROMPT.md"
-    prompt = path.read_text(encoding="utf-8")
-    assert "packet" in prompt.lower()
-    assert "snapshot_id" in prompt
-    assert "as-of cutoff" in prompt
+    assert 0 < len(instructions) < 8_000
+    # Historical exporter behavior remains covered above. Its former textual PASS-only
+    # admission contract is not policy for the separately governed advisory interface.
