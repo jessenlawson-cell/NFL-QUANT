@@ -407,6 +407,8 @@ def load_key(root):
 
 
 def export_handoff(root, db, events, now, only_if_changed=False):
+    from scripts.capture_nfl_context import read_context
+
     week = week_bucket(now)
     rows = list(db.execute("SELECT * FROM calls WHERE week=? ORDER BY started", (week,)))
     snapshots = [
@@ -430,6 +432,7 @@ def export_handoff(root, db, events, now, only_if_changed=False):
         "schema_version": "market-intelligence-weekly-1",
         "week_bucket": week,
         "generated_at_utc": now.isoformat(),
+        "football_context": read_context(root, now),
         "snapshots": snapshots,
         "uncaptured_event_ids": sorted(e for e in in_scope if e not in captured),
         "missed_event_ids": sorted(
@@ -445,13 +448,17 @@ def export_handoff(root, db, events, now, only_if_changed=False):
         "instructions": "Use individual capture/quote times, not this packet's generation time. "
         "Missing data is unknown. US prices are not Ontario prices. No player name joins. "
         "This is market evidence, not a calibrated prediction or proven edge. "
-        "Ask for current bet365 Ontario quotes and fresh injury/weather context.",
+        "Use football_context source timestamps and coverage limits; missing inactives "
+        "do not mean active. City weather is approximate, not stadium observations. "
+        "Ask for current bet365 Ontario quotes and verify any stale football context.",
     }
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {k: v for k, v in body.items() if k != "generated_at_utc"}, sort_keys=True
-        ).encode()
-    ).hexdigest()
+    meaningful = {k: v for k, v in body.items() if k != "generated_at_utc"}
+    meaningful["football_context"] = {
+        k: v
+        for k, v in body["football_context"].items()
+        if k not in {"generated_at_utc", "context_age_seconds", "free_requests_this_refresh"}
+    }
+    fingerprint = hashlib.sha256(json.dumps(meaningful, sort_keys=True).encode()).hexdigest()
     previous = db.execute("SELECT value FROM metadata WHERE key=?", (f"{week}:handoff",)).fetchone()
     if only_if_changed and previous and previous[0] == fingerprint:
         return None
@@ -466,7 +473,30 @@ def export_handoff(root, db, events, now, only_if_changed=False):
 def run(root, execute=False, events_path=None, deep_event=None, preflight=False):
     # Serialize free discovery too: a stale balance must never overwrite a paid response.
     with worker_lock(root):
-        return run_locked(root, execute, events_path, deep_event, preflight)
+        result, output = None, None
+        try:
+            result = run_locked(root, execute, events_path, deep_event, preflight)
+        finally:
+            if execute:
+                # Independent free context still runs if odds discovery/budgeting fails.
+                try:
+                    from scripts.capture_nfl_context import collect
+
+                    collect(root, datetime.now(UTC))
+                except Exception as error:
+                    print(f"FREE_CONTEXT_REFRESH_FAILED: {type(error).__name__}", file=sys.stderr)
+                try:
+                    with closing(open_ledger(root)) as db:
+                        event_file = root / "data/runtime/market_intelligence/events.json"
+                        events = json.loads(event_file.read_bytes()) if event_file.exists() else []
+                        output = export_handoff(
+                            root, db, events, datetime.now(UTC), only_if_changed=True
+                        )
+                except Exception as error:
+                    print(f"CONTEXT_HANDOFF_FAILED: {type(error).__name__}", file=sys.stderr)
+        if output and result is not None:
+            result["handoff"] = str(output)
+        return result
 
 
 def run_locked(root, execute=False, events_path=None, deep_event=None, preflight=False, now=None):
@@ -555,6 +585,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true", help="Allow budgeted provider calls")
     parser.add_argument(
+        "--refresh-context",
+        action="store_true",
+        help="Refresh free NFL context and export a handoff; no odds provider calls",
+    )
+    parser.add_argument(
         "--preflight", action="store_true", help="Free event discovery only; no odds calls"
     )
     parser.add_argument("--events", type=Path, help="Offline event fixture/cache for dry-run")
@@ -562,6 +597,27 @@ def main():
         "--deep-event", help="Exact provider event ID for this week's deeper capture"
     )
     args = parser.parse_args()
+    if args.refresh_context:
+        if args.execute or args.preflight:
+            parser.error("--refresh-context cannot be combined with odds network modes")
+        from scripts.capture_nfl_context import collect
+
+        root = Path(__file__).resolve().parents[1]
+        with worker_lock(root), closing(open_ledger(root)) as db:
+            body = collect(root, datetime.now(UTC))
+            event_file = root / "data/runtime/market_intelligence/events.json"
+            events = json.loads(event_file.read_bytes()) if event_file.exists() else []
+            output = export_handoff(root, db, events, datetime.now(UTC))
+        print(
+            json.dumps(
+                {
+                    "mode": "FREE_CONTEXT_ONLY",
+                    "requests": body["free_requests_this_refresh"],
+                    "handoff": str(output),
+                }
+            )
+        )
+        return 0
     if args.preflight and args.execute:
         parser.error("Choose either --preflight or --execute")
     root = Path(__file__).resolve().parents[1]
@@ -585,4 +641,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     sys.exit(main())

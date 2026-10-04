@@ -22,6 +22,9 @@ class MarketCaptureTests(unittest.TestCase):
         self.m = importlib.util.module_from_spec(SPEC)
         SPEC.loader.exec_module(self.m)
         self.now = datetime(2026, 10, 4, 16, 0, tzinfo=UTC)
+        context = patch("scripts.capture_nfl_context.collect", return_value={})
+        context.start()
+        self.addCleanup(context.stop)
         self.store = self.m.open_ledger(self.root)
         self.addCleanup(self.store.close)
 

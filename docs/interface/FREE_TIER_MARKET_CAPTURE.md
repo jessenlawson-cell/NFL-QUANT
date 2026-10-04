@@ -20,6 +20,44 @@ Extra: passing TDs, attempts, completions, interceptions; rush attempts, longest
 longest reception and anytime TD. Markets/books may be absent; missingness is reported.
 
 ## Run and inspect
+### Automated football context
+
+The same scheduled worker now adds `football_context` to cumulative handoffs after
+the odds attempt. This runs even if odds discovery fails; source errors do not change
+the paid-call ledger or block independent coverage. No new task, API key, subscription
+or Odds API credit expansion is needed.
+
+- NFL.com injury tables are parsed with explicit schema/season checks.
+- Published official NFL inactive articles are discovered from the news index.
+  Only position-labelled entries within article/team list sections count. Unpublished
+  lists remain unknown; no inference that a player is active. Emergency QB annotations
+  are preserved, not treated as an ordinary absence.
+- ESPN provides separate event/team/venue IDs and the week schedule, including Monday
+  night after midnight UTC. These are not joined to odds events or players by names.
+- Open-Meteo forecasts cover upcoming kickoffs within three days. Location matching
+  requires an unambiguous city/country/US-state result. These are explicitly approximate
+  CITY forecasts, not precise stadium measurements. Indoor flags are source metadata,
+  not proof of retractable-roof position. Unmatched locations remain unknown.
+
+Refreshes are cached for an hour, or 15 minutes near kickoff; geocoding successes are
+cached longer. At most 24 free requests and a 60-second admission window per refresh;
+in-flight requests have an 8-second timeout. Initial coverage may take multiple ticks.
+Failures are recorded and rechecked on later scheduled ticks, never as immediate retries.
+Raw bodies are immutable with hashes and source URLs; parsed caches are disposable.
+Original source capture times are preserved on failed refreshes. Missing publication/model
+issue times remain null. Source availability is established only from actual retrieval.
+
+`py -3.14 scripts/capture_market_intelligence.py --refresh-context` refreshes ONLY free
+context and exports a handoff using existing odds records; it never calls The Odds API.
+Do not confuse its successful exit with complete source coverage: inspect source statuses.
+
+Weather attribution: [Open-Meteo](https://open-meteo.com/), CC BY 4.0.
+Its free hosted API is for personal/non-commercial use; do not commercialize this worker
+without rechecking [terms](https://open-meteo.com/en/terms).
+Sources: [NFL injuries](https://www.nfl.com/injuries/), [NFL news](https://www.nfl.com/news),
+[Open-Meteo documentation](https://open-meteo.com/en/docs). ESPN's public endpoint is
+secondary schedule/venue evidence, not an NFL-authorized guaranteed API contract.
+
 `py -3.14 scripts/capture_market_intelligence.py` is offline/no-network dry-run.
 `py -3.14 scripts/capture_market_intelligence.py --preflight` performs zero-credit
 live event discovery and checks actual account quota without requesting any odds.
@@ -41,7 +79,7 @@ Read task state/last result in Windows Task Scheduler. A nonzero result requires
 Upload the newest `weekly_handoff_*.json` to the weekly ChatGPT chat. Its generation time
 does not make older quotes current. Retain snapshot/quote timestamps, coverage gaps and
 limitations. ChatGPT is not auto-connected to local files. Provide actual bet365 Ontario
-quotes separately; current injuries, weather and player usage need separate sources.
+quotes separately; check football_context freshness/coverage and research player usage separately.
 
 ## Safety and reconciliation
 An OS file lock serializes discovery through completion, preventing stale quota overwrites.
