@@ -9,3 +9,10 @@
 /data/runtime/**
 /data/staging/**
 /artifacts/models/**
+
+# Superseded modelling instructions: preserved, inspect explicitly for historical work.
+/docs/historical/**
+/docs/superpowers/**
+/MODEL_SPEC*.md
+/STAGE_*.md
+/SEQUENCE_*.md
